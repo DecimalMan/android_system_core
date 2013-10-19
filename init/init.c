@@ -46,6 +46,10 @@
 
 #include <sys/system_properties.h>
 
+#ifndef INITLOGO
+#include <linux/kd.h>
+#endif
+
 #include "devices.h"
 #include "init.h"
 #include "log.h"
@@ -100,6 +104,8 @@ static char *console_name = "/dev/console";
 static time_t process_needs_restart;
 
 static const char *ENV[32];
+
+static unsigned emmc_boot = 0;
 
 static unsigned charging_mode = 0;
 
@@ -342,14 +348,12 @@ void service_start(struct service *svc, const char *dynamic_args)
         for (ei = svc->envvars; ei; ei = ei->next)
             add_environment(ei->name, ei->value);
 
-        setsockcreatecon(scon);
-
         for (si = svc->sockets; si; si = si->next) {
             int socket_type = (
                     !strcmp(si->type, "stream") ? SOCK_STREAM :
                         (!strcmp(si->type, "dgram") ? SOCK_DGRAM : SOCK_SEQPACKET));
             int s = create_socket(si->name, socket_type,
-                                  si->perm, si->uid, si->gid);
+                                  si->perm, si->uid, si->gid, si->socketcon ?: scon);
             if (s >= 0) {
                 publish_socket(si->name, s);
             }
@@ -357,7 +361,6 @@ void service_start(struct service *svc, const char *dynamic_args)
 
         freecon(scon);
         scon = NULL;
-        setsockcreatecon(NULL);
 
         if (svc->ioprio_class != IoSchedClass_NONE) {
             if (android_set_ioprio(getpid(), svc->ioprio_class, svc->ioprio_pri)) {
@@ -651,6 +654,7 @@ static int console_init_action(int nargs, char **args)
         have_console = 1;
     close(fd);
 
+#ifdef INITLOGO
     if( load_565rle_image(INIT_IMAGE_FILE) ) {
         fd = open("/dev/tty0", O_WRONLY);
         if (fd >= 0) {
@@ -674,6 +678,13 @@ static int console_init_action(int nargs, char **args)
             close(fd);
         }
     }
+#else
+    fd = open("/dev/tty0", O_RDWR | O_SYNC);
+    if (fd >= 0) {
+        ioctl(fd, KDSETMODE, KD_GRAPHICS);
+        close(fd);
+    }
+#endif
     return 0;
 }
 
@@ -703,6 +714,12 @@ static void import_kernel_nv(char *name, int for_emulator)
 
     if (!strcmp(name,"qemu")) {
         strlcpy(qemu, value, sizeof(qemu));
+#ifdef WANTS_EMMC_BOOT
+    } else if (!strcmp(name,"androidboot.emmc")) {
+        if (!strcmp(value,"true")) {
+            emmc_boot = 1;
+        }
+#endif
     } else if (!strcmp(name,BOARD_CHARGING_CMDLINE_NAME)) {
         strlcpy(battchg_pause, value, sizeof(battchg_pause));
     } else if (!strncmp(name, "androidboot.", 12) && name_len > 12) {
@@ -713,6 +730,10 @@ static void import_kernel_nv(char *name, int for_emulator)
         cnt = snprintf(prop, sizeof(prop), "ro.boot.%s", boot_prop_name);
         if (cnt < PROP_NAME_MAX)
             property_set(prop, value);
+#ifdef HAS_SEMC_BOOTLOADER
+    } else if (!strcmp(name,"serialno")) {
+        property_set("ro.boot.serialno", value);
+#endif
     }
 }
 
@@ -753,6 +774,8 @@ static void export_kernel_boot_props(void)
 
     snprintf(tmp, PROP_VALUE_MAX, "%d", revision);
     property_set("ro.revision", tmp);
+    property_set("ro.emmc",emmc_boot ? "1" : "0");
+    property_set("ro.boot.emmc", emmc_boot ? "1" : "0");
 
     /* TODO: these are obsolete. We should delete them */
     if (!strcmp(bootmode,"factory"))
@@ -940,6 +963,11 @@ int main(int argc, char **argv)
          * together in the initramdisk on / and then we'll
          * let the rc file figure out the rest.
          */
+    /* Don't repeat the setup of these filesystems,
+     * it creates double mount points with an unknown effect
+     * on the system.  This init file is for 2nd-init anyway.
+     */
+#ifndef NO_DEVFS_SETUP
     mkdir("/dev", 0755);
     mkdir("/proc", 0755);
     mkdir("/sys", 0755);
@@ -962,6 +990,7 @@ int main(int argc, char **argv)
          */
     open_devnull_stdio();
     klog_init();
+#endif
     property_init();
 
     get_hardware_name(hardware, &revision);
@@ -1007,6 +1036,18 @@ int main(int argc, char **argv)
     else
        init_parse_config_file("/lpm.rc");
 
+    /* Check for an emmc initialisation file and read if present */
+    if (emmc_boot && access("/init.emmc.rc", R_OK) == 0) {
+        INFO("Reading emmc config file");
+            init_parse_config_file("/init.emmc.rc");
+    }
+
+    /* Check for a target specific initialisation file and read if present */
+    if (access("/init.target.rc", R_OK) == 0) {
+        INFO("Reading target specific config file");
+            init_parse_config_file("/init.target.rc");
+    }
+
     action_for_each_trigger("early-init", action_add_queue_tail);
 
     queue_builtin_action(wait_for_coldboot_done_action, "wait_for_coldboot_done");
@@ -1019,7 +1060,11 @@ int main(int argc, char **argv)
     /* skip mounting filesystems in charger mode */
     if (!is_charger) {
         action_for_each_trigger("early-fs", action_add_queue_tail);
-        action_for_each_trigger("fs", action_add_queue_tail);
+        if(emmc_boot) {
+            action_for_each_trigger("emmc-fs", action_add_queue_tail);
+        } else {
+            action_for_each_trigger("fs", action_add_queue_tail);
+        }
         action_for_each_trigger("post-fs", action_add_queue_tail);
         action_for_each_trigger("post-fs-data", action_add_queue_tail);
     }
